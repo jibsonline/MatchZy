@@ -375,6 +375,10 @@ namespace MatchZy
             SetLiveFlags();
             KillPhaseTimers();
             ExecLiveCFG();
+            // The match config's cvars also go in right after the live config, well before its mp_restartgame takes effect,
+            // so the restart starts the map with them rather than the live config's values. (The timer below can run after
+            // the restart: the restart sets each team's tactical timeouts from mp_team_timeout_max.)
+            Server.NextFrame(ExecuteChangedConvars);
             // Adding timer here to make sure that CFG execution is completed till then
             AddTimer(1, () =>
             {
@@ -387,6 +391,7 @@ namespace MatchZy
         {
             SetupLiveFlagsAndCfg();
             StartDemoRecordingAfterRestart(liveRestartDelay);
+            SetMatchTimeoutsAfterRestart(liveRestartDelay);
 
             // Storing 0-0 score backup file as lastBackupFileName, so that .stop functions properly in first round.
             lastBackupFileName = $"matchzy_{liveMatchId}_{matchConfig.CurrentMapNumber}_round00.txt";
@@ -1731,6 +1736,36 @@ namespace MatchZy
             string formattedHostname = FormatCvarValue(hostname);
             Log($"UPDATING HOSTNAME TO: {formattedHostname}");
             Server.ExecuteCommand($"hostname {formattedHostname}");
+        }
+
+        // Once a map is live, gives each team the tactical timeouts the match config sets (mp_team_timeout_max, and
+        // mp_team_timeout_time for their length), whatever the live config set when the game restarted. Only before the
+        // first round is played and while no timeout is running, so a round restore never gives timeouts back.
+        private void SetMatchTimeoutsAfterRestart(float restartDelay)
+        {
+            if (!matchConfig.ChangedCvars.TryGetValue("mp_team_timeout_max", out var maxValue) ||
+                !int.TryParse(maxValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out int timeouts) || timeouts < 0) return;
+            float? length = null;
+            if (matchConfig.ChangedCvars.TryGetValue("mp_team_timeout_time", out var timeValue) &&
+                float.TryParse(timeValue, NumberStyles.Float, CultureInfo.InvariantCulture, out float seconds) && seconds > 0) length = seconds;
+            AddTimer(restartDelay + 1, () =>
+            {
+                if (!isMatchLive) return;
+                var proxy = Utilities.FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules").FirstOrDefault();
+                var gameRules = proxy?.GameRules;
+                if (proxy == null || gameRules == null) return;
+                if (gameRules.TotalRoundsPlayed > 0 || gameRules.TerroristTimeOutActive || gameRules.CTTimeOutActive) return;
+                if (gameRules.TerroristTimeOuts == timeouts && gameRules.CTTimeOuts == timeouts) return;
+                Log($"[SetMatchTimeoutsAfterRestart] Tactical timeouts per team: {timeouts} (were T {gameRules.TerroristTimeOuts}, CT {gameRules.CTTimeOuts})");
+                gameRules.TerroristTimeOuts = timeouts;
+                gameRules.CTTimeOuts = timeouts;
+                if (length.HasValue)
+                {
+                    gameRules.TerroristTimeOutRemaining = length.Value;
+                    gameRules.CTTimeOutRemaining = length.Value;
+                }
+                Utilities.SetStateChanged(proxy, "CCSGameRulesProxy", "m_pGameRules");
+            });
         }
 
         public CCSGameRules GetGameRules()
